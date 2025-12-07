@@ -1,1 +1,216 @@
+# main.py
+import os
+import json
+import asyncio
+import datetime
+import pytz
+from flask import Flask, request
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 
+from deriv_ws import start_all, get_recent_prices, PAIRS
+from strategy import compute_simple_indicators, base_confidence, direction_from_ind
+from groq_client import groq_predict_json
+
+# ENV
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+SECRET_PATH = os.environ.get("SECRET_PATH", "blacklionwebhook")
+CHAT_ID = os.environ.get("CHAT_ID")  # optional default
+MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "85"))
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Set TELEGRAM_TOKEN in env")
+
+app = Flask(__name__)
+
+# Start Deriv collection threads
+start_all()
+
+# Telegram app
+bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+# rate limiter
+request_log = []
+def can_execute():
+    now = datetime.datetime.now().timestamp()
+    global request_log
+    request_log = [t for t in request_log if now - t < 20*60]
+    return len(request_log) < 10
+def log_request():
+    request_log.append(datetime.datetime.now().timestamp())
+
+TRADES_FILE = "trades.json"
+def load_trades():
+    try:
+        with open(TRADES_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+def save_trade(t):
+    arr = load_trades()
+    arr.append(t)
+    with open(TRADES_FILE, "w") as f:
+        json.dump(arr, f, indent=2)
+
+# handlers
+async def start_cmd(update: Update, context):
+    pairs = ", ".join(list(PAIRS.keys()))
+    await update.message.reply_text(f"🦁 Black Lion V4.2 ready. Supported pairs: {pairs}\nType /scan to request a high-confidence signal.")
+
+async def scan_cmd(update: Update, context):
+    if not can_execute():
+        await update.message.reply_text("⛔ Slow down — max 10 scans per 20 minutes.")
+        return
+    log_request()
+
+    results = []
+    for p in list(PAIRS.keys()):
+        prices = get_recent_prices(p, n=120)
+        ind = compute_simple_indicators(prices)
+        if not ind:
+            continue
+        base_conf = base_confidence(ind)
+        direction = direction_from_ind(ind)
+        reason_local = f"momentum={ind['diff']:.5f}, vol={ind['vol']:.5f}, sma_short={ind['sma_short']:.5f}, sma_long={ind['sma_long']:.5f}"
+        # try Groq refinement
+        market_context = f"pair={p}; last={ind['last']:.5f}; {reason_local}; initial_direction={direction}; initial_confidence={base_conf}"
+        groq_resp = groq_predict_json(market_context)
+        if groq_resp:
+            try:
+                # accept groq output
+                direction = groq_resp.get("direction", direction)
+                base_conf = int(groq_resp.get("confidence", base_conf))
+                reason = groq_resp.get("reason", reason_local)
+            except Exception:
+                reason = reason_local
+        else:
+            reason = reason_local
+
+        res = {
+            "pair": p,
+            "direction": direction,
+            "confidence": base_conf,
+            "reason": reason,
+            "last_price": ind["last"]
+        }
+        results.append(res)
+
+    if not results:
+        await update.message.reply_text("No sufficient market data yet. Try again in a few seconds.")
+        return
+
+    results = sorted(results, key=lambda x: x["confidence"], reverse=True)
+    top = results[0]
+
+    if top["confidence"] < MIN_CONFIDENCE:
+        await update.message.reply_text(f"No signals meet the confidence threshold ({MIN_CONFIDENCE}%). Best candidate: {top['pair']} at {top['confidence']}% — wait for clearer setup.")
+        return
+
+    now = datetime.datetime.now(pytz.UTC)
+    entry = now + datetime.timedelta(seconds=30)
+    expiry = entry + datetime.timedelta(minutes=1)
+
+    text = (
+        f"🦁 *BLACK LION SIGNAL* 🦁\n\n"
+        f"*Pair:* {top['pair']}\n"
+        f"*Direction:* {top['direction']}\n"
+        f"*Last Price:* {top['last_price']}\n"
+        f"*Confidence:* {top['confidence']}%\n"
+        f"*Reason:* {top['reason']}\n\n"
+        f"*Entry (UTC):* {entry.strftime('%H:%M:%S')}\n"
+        f"*Expiry (UTC):* {expiry.strftime('%H:%M:%S')}\n"
+    )
+
+    # Inline buttons — no auto trade
+    buttons = [
+        [InlineKeyboardButton("✅ I will take this", callback_data=f"take|{top['pair']}|{top['direction']}|{top['last_price']}|{entry.isoformat()}|{expiry.isoformat()}"),
+         InlineKeyboardButton("❌ Ignore", callback_data="ignore")]
+    ]
+    markup = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+
+async def button_cb(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "ignore":
+        await query.edit_message_text(query.message.text + "\n\n⛔ Ignored by user.")
+        return
+    parts = data.split("|")
+    if parts[0] == "take":
+        _, pair, direction, price_str, entry_iso, expiry_iso = parts
+        entry_time = entry_iso
+        expiry_time = expiry_iso
+        entry_price = float(price_str)
+        trade = {
+            "pair": pair,
+            "direction": direction,
+            "entry_price": entry_price,
+            "entry_time": entry_time,
+            "expiry_time": expiry_time,
+            "user_id": query.from_user.id,
+            "status": "pending"
+        }
+        save_trade(trade)
+        await query.edit_message_text(query.message.text + f"\n\n🦁 Logged: {direction} {pair} at {entry_price}. I will follow up after expiry.")
+        # schedule followup
+        asyncio.create_task(schedule_followup(query.message.chat_id, trade))
+        return
+
+async def schedule_followup(chat_id, trade):
+    expiry = datetime.datetime.fromisoformat(trade["expiry_time"])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    wait = (expiry - now).total_seconds()
+    if wait > 0:
+        await asyncio.sleep(wait + 1)
+    prices = get_recent_prices(trade["pair"], n=10)
+    if not prices:
+        result_text = "No price available to check result."
+    else:
+        last = prices[-1]
+        if trade["direction"] == "CALL":
+            verdict = "WIN" if last > trade["entry_price"] else "LOSS"
+        else:
+            verdict = "WIN" if last < trade["entry_price"] else "LOSS"
+        # update trades file
+        arr = load_trades()
+        updated = False
+        for t in arr:
+            if t.get("entry_time") == trade["entry_time"] and t.get("expiry_time") == trade["expiry_time"] and t.get("entry_price") == trade["entry_price"]:
+                t["status"] = verdict
+                t["close_price"] = last
+                updated = True
+        if updated:
+            with open(TRADES_FILE, "w") as f:
+                json.dump(arr, f, indent=2)
+        result_text = (
+            f"🦁 *FOLLOW-UP* — {trade['pair']} {trade['direction']}\n"
+            f"Entry price: {trade['entry_price']}\n"
+            f"Close price: {last}\n"
+            f"Result: *{verdict}*"
+        )
+    await bot_app.bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
+
+# register handlers
+bot_app.add_handler(CommandHandler("start", start_cmd))
+bot_app.add_handler(CommandHandler("scan", scan_cmd))
+bot_app.add_handler(CallbackQueryHandler(button_cb))
+
+# webhook
+@app.post(f"/{SECRET_PATH}")
+def webhook():
+    data = request.get_json(force=True)
+    update = Update.de_json(data, bot_app.bot)
+    bot_app.update_queue.put_nowait(update)
+    return "OK", 200
+
+@app.get("/")
+def index():
+    return "Black Lion V4.2 (Deriv + Groq) alive", 200
+
+# run
+if __name__ == "__main__":
+    bot_app.initialize()
+    bot_app.start()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
