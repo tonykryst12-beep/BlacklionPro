@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+trades.json
+config.py
+.env
